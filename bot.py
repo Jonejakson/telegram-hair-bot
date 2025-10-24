@@ -69,7 +69,7 @@ def offer_subscription(chat_id):
     markup = types.InlineKeyboardMarkup()
     subscribe_btn = types.InlineKeyboardButton(
         "🌟 Подписаться на канал", 
-        url=f"https://t.me/{CHANNEL_USERNAME}"
+        url="https://t.me/+fOyv1FQvih4wNGY6"  # Ваша пригласительная ссылка
     )
     already_btn = types.InlineKeyboardButton(
         "✅ Я уже подписан", 
