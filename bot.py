@@ -5,6 +5,7 @@ import requests
 import re
 import os
 import time
+import datetime
 
 # Конфигурация
 BOT_TOKEN = "8469042166:AAGTV250nbgUTHe14CVba66tFXSIwcEGG7o"
@@ -26,14 +27,29 @@ def check_subscription(user_id):
 def send_welcome(message):
     user_id = message.from_user.id
     
+    # ЛОГИРОВАНИЕ UTM-МЕТОК
+    source = message.text.replace('/start ', '').strip()
+    if not source:
+        source = 'direct'
+    
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    user_info = f"{user_id} (@{message.from_user.username}, {message.from_user.first_name})"
+    
+    # Логируем в консоль
+    print(f"🎯 {timestamp} - /start от {user_info} | Источник: {source}")
+    
+    # Логируем в файл
+    with open('bot_logs.txt', 'a', encoding='utf-8') as f:
+        f.write(f"{timestamp} - /start от {user_info} | Источник: {source}\n")
+    
     # СРАЗУ отправляем файл без проверок
-    send_file_immediately(message.chat.id, user_id)
+    send_file_immediately(message.chat.id, user_id, source)
     
     # Через 2 секунды предлагаем подписаться
     time.sleep(2)
     offer_subscription(message.chat.id)
 
-def send_file_immediately(chat_id, user_id):
+def send_file_immediately(chat_id, user_id, source='unknown'):
     try:
         file_path = 'diagnostika_volosy.pdf'
         
@@ -49,14 +65,14 @@ def send_file_immediately(chat_id, user_id):
                 parse_mode='Markdown'
             )
         
-        # Логирование для админа
+        # Логирование для админа с указанием источника
         user_info = {
             'username': f"@{user_id}" if not user_id else str(user_id),
             'first_name': user_id if user_id else "Не указано"
         }
         
         try:
-            admin_message = f"📥 Новый скачивание!\n👤 Пользователь: {user_info['first_name']}\n🆔 ID: {user_id}"
+            admin_message = f"📥 Новый скачивание!\n👤 Пользователь: {user_info['first_name']}\n🆔 ID: {user_id}\n📊 Источник: {source}"
             bot.send_message(ADMIN_CHAT_ID, admin_message)
         except Exception as admin_error:
             print(f"Ошибка отправки админу: {admin_error}")
@@ -137,6 +153,7 @@ def handle_consultation(message):
 
 if __name__ == "__main__":
     print("🤖 Бот запущен по новой схеме!")
+    print("📊 Логирование UTM-меток активировано")
     while True:
         try:
             bot.polling(none_stop=True, timeout=60)
