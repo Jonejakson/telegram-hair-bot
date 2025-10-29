@@ -49,6 +49,12 @@ def send_welcome(message):
     time.sleep(2)
     offer_subscription(message.chat.id)
 
+# Обработчик для текстового сообщения "Старт"
+@bot.message_handler(func=lambda message: message.text and message.text.lower() in ['старт', 'start', 'начать'])
+def handle_start_text(message):
+    # Просто вызываем ту же функцию, что и для /start
+    send_welcome(message)
+
 def send_file_immediately(chat_id, user_id, source='unknown'):
     try:
         file_path = 'diagnostika_volosy.pdf'
@@ -110,6 +116,36 @@ def offer_subscription(chat_id):
         parse_mode='Markdown'
     )
 
+# Обработчик для описания бота (когда пользователь открывает бота впервые)
+@bot.message_handler(commands=['help', 'info'])
+@bot.message_handler(func=lambda message: message.text and message.text.lower() in ['помощь', 'инфо', 'info', 'что ты умеешь'])
+def show_bot_info(message):
+    info_text = """🤖 **Что умеет этот бот?**
+
+Добро пожаловать в мой телеграм-бот! Я создала его, чтобы нам было проще взаимодействовать.
+
+✨ **Основные функции:**
+• 🎁 Выдать бесплатный PDF-гид «Диагностика волос»
+• 📱 Принять заявку на персональную консультацию
+• 💎 Пригласить в полезный канал о волосах
+
+🚀 **Чтобы начать, просто напишите «Старт» или нажмите /start**
+
+С заботой о ваших волосах,
+Елена 💫"""
+    
+    # Добавляем кнопку "Старт" под описанием
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    start_btn = types.KeyboardButton("🚀 Старт")
+    markup.add(start_btn)
+    
+    bot.send_message(
+        message.chat.id,
+        info_text,
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
 @bot.callback_query_handler(func=lambda call: call.data == "already_subscribed")
 def handle_already_subscribed(call):
     user_id = call.from_user.id
@@ -151,9 +187,17 @@ def handle_consultation(message):
         parse_mode='Markdown'
     )
 
+# Обработчик для любого сообщения, которое не подошло под другие хендлеры
+@bot.message_handler(func=lambda message: True)
+def handle_other_messages(message):
+    if message.text.lower() not in ['старт', 'start', 'начать', 'помощь', 'инфо', 'info', 'что ты умеешь']:
+        # Показываем описание бота и предлагаем начать
+        show_bot_info(message)
+
 if __name__ == "__main__":
     print("🤖 Бот запущен по новой схеме!")
     print("📊 Логирование UTM-меток активировано")
+    print("🎯 Добавлены текстовые команды: Старт, Помощь")
     while True:
         try:
             bot.polling(none_stop=True, timeout=60)
