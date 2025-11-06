@@ -1,370 +1,340 @@
 # -*- coding: utf-8 -*-
-import telebot
-from telebot import types
 import os
-import time
+import logging
+import asyncio
 import datetime
+import json
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.types import ParseMode, InputFile
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.date import DateTrigger
+from dotenv import load_dotenv
+import aiofiles
 
-# Конфигурация
-BOT_TOKEN = "8469042166:AAGTV250nbgUTHe14CVba66tFXSIwcEGG7o"
-CHANNEL_USERNAME = "volosy_v_fokuse"
-CHANNEL_CHAT_ID = -1002194057942
-ADMIN_CHAT_ID = "680094245"
+# Загрузка конфигов
+load_dotenv()
+BOT_TOKEN = 8469042166:AAGTV250nbgUTHe14CVba66tFXSIwcEGG7o
+ADMIN_CHAT_ID = 680094245
 
-# Продукты
+# Параметры продуктов (ключи используются в логике)
 PRODUCTS = {
-    'free': {
-        'name': '🎁 ДИАГНОСТИКА ВОЛОС',
-        'file': 'diagnostika_volosy.pdf',
-        'price': 0,
-        'description': 'Бесплатный гайд «Диагностика волос»',
-        'caption': "🎁 **Ваш PDF-гид «Диагностика волос»**\n\n_Изучайте и применяйте! Теперь вы знаете о волосах больше, чем 90% людей_ ✨"
+    "free": {
+        "name": "🎁 ДИАГНОСТИКА ВОЛОС",
+        "file": "diagnostika_volosy.pdf",
+        "price": 0,
+        "description": "Бесплатный гайд «Диагностика волос»",
+        "caption": "🎁 *Ваш PDF-гид «Диагностика волос»*\n\n_Изучайте и применяйте! Теперь вы знаете о волосах больше, чем 90% людей_ ✨"
     },
-    'seasonal': {
-        'name': '🍂 ОСЕННЕ-ЗИМНИЙ УХОД',
-        'file': 'osenne-zimniy-uhod.pdf',
-        'price': 200,
-        'description': 'Платный гайд «Осенне-зимний уход за волосами»',
-        'caption': "🍂 **Ваш гайд «Осенне-зимний уход за волосами»**\n\n*Идеальный уход в холодное время года!*\n\nСохраните красоту и здоровье волос зимой! ❄️"
+    "seasonal": {
+        "name": "🍂 ОСЕННЕ-ЗИМНИЙ УХОД",
+        "file": "osenne-zimniy-uhod.pdf",
+        "price": 200,
+        "description": "Платный гайд «Осенне-зимний уход за волосами»",
+        "caption": "🍂 *Ваш гайд «Осенне-зимний уход за волосами»*\n\n*Идеальный уход в холодное время года!*"
+    },
+    "consult": {
+        "name": "👑 ИНДИВИДУАЛЬНАЯ КОНСУЛЬТАЦИЯ",
+        "file": None,
+        "price": 1500,
+        "description": "Персональная консультация (30 минут)",
+        "caption": "👑 *Спасибо за запись на консультацию!*"
     }
 }
 
-# Фиксированная ссылка оплаты для сезонного гайда
-YOOMONEY_LINK = f"https://yoomoney.ru/to/4100119396443411/{PRODUCTS['seasonal']['price']}"
+YOOMONEY_BASE = "https://yoomoney.ru/to/4100119396443411/"
 
-bot = telebot.TeleBot(BOT_TOKEN)
+# Логи
+LOGFILE = "bot_logs.txt"
+PENDING_FILE = "pending_payments.json"  # чтобы хранить pending-момент между рестартами
 
-def log_action(user_id, username, first_name, action, source='direct', product_type='free', amount=0):
-    """Универсальная функция логирования"""
+# Инициализация бота
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(bot)
+
+scheduler = AsyncIOScheduler()
+scheduler.start()
+
+# В памяти: храним pending платежи {user_id: {product, amount, time, source}}
+pending = {}
+
+# Загрузить pending из файла (если есть)
+if os.path.exists(PENDING_FILE):
+    try:
+        with open(PENDING_FILE, "r", encoding="utf-8") as f:
+            pending = json.load(f)
+    except Exception:
+        pending = {}
+
+# ======================================
+# Утилиты
+# ======================================
+async def log_action(user_id, username, first_name, action, source='direct', product_type='free', amount=0):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     user_info = f"{user_id} (@{username}, {first_name})"
-    
     log_message = f"{timestamp} - {action} от {user_info}"
-    if source != 'direct':
+    if source and source != 'direct':
         log_message += f" | Источник: {source}"
-    if product_type != 'free':
+    if product_type and product_type != 'free':
         log_message += f" | Продукт: {product_type}"
-    if amount > 0:
+    if amount and amount > 0:
         log_message += f" | Сумма: {amount} руб"
-    
-    print(f"📝 {log_message}")
-    
-    with open('bot_logs.txt', 'a', encoding='utf-8') as f:
-        f.write(f"{log_message}\n")
-    
-    if action in ['ПОКУПКА', 'УСПЕШНАЯ ОПЛАТА']:
+    print("📝", log_message)
+    async with aiofiles.open(LOGFILE, 'a', encoding='utf-8') as f:
+        await f.write(log_message + "\n")
+
+    # админ оповещение для покупок/оплаты
+    if action in ['ПОКУПКА_ЗАПРОС', 'PENDING_PAYMENT']:
         try:
-            admin_msg = f"💰 {action}\n👤 {user_info}"
-            if amount > 0:
-                admin_msg += f"\n💵 Сумма: {amount} руб"
-            bot.send_message(ADMIN_CHAT_ID, admin_msg)
+            admin_msg = f"💰 {action}\n👤 {user_info}\nПродукт: {product_type}\nСумма: {amount} руб\nИсточник: {source}\n\nКоманда для выдачи: /grant {user_id} {product_type}"
+            await bot.send_message(ADMIN_CHAT_ID, admin_msg)
         except Exception as e:
-            print(f"Ошибка отправки админу: {e}")
+            print("Ошибка отправки админу:", e)
 
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    user_id = message.from_user.id
-    username = message.from_user.username or "нет"
-    first_name = message.from_user.first_name or "Неизвестно"
-    
-    source = message.text.replace('/start ', '').strip()
-    if not source:
-        source = 'direct'
-    
-    log_action(user_id, username, first_name, 'START', source)
-    show_main_menu(message.chat.id, user_id, username, first_name, source)
+def get_yoomoney_link(amount: int):
+    # динамически формируем ссылку — YooMoney принимает сумму в конце
+    return f"{YOOMONEY_BASE}{amount}"
 
-def show_main_menu(chat_id, user_id, username, first_name, source):
-    """Показывает главное меню с выбором продуктов"""
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    
-    free_btn = types.KeyboardButton(PRODUCTS['free']['name'])
-    seasonal_btn = types.KeyboardButton(PRODUCTS['seasonal']['name'])
-    consultation_btn = types.KeyboardButton("👑 КОНСУЛЬТАЦИЯ")
-    info_btn = types.KeyboardButton("ℹ️ ПОМОЩЬ")
-    
-    markup.add(free_btn, seasonal_btn)
-    markup.add(consultation_btn, info_btn)
-    
-    menu_text = f"""✨ *ДОБРО ПОЖАЛОВАТЬ В МОЙ БОТ!*
-
-Здесь вы можете получить:
-
-{PRODUCTS['free']['name']} - *БЕСПЛАТНО*
-• Определение типа, пористости и потребностей волос
-• 3 простых теста для диагностики
-• Четкий план действий
-
-{PRODUCTS['seasonal']['name']} - *{PRODUCTS['seasonal']['price']} руб*
-• Уход в холодное время года
-• Защита от мороза и сухости
-• Борьба с электризацией и спутанностью
-• Сезонные рекомендации
-
-👑 *ПЕРСОНАЛЬНАЯ КОНСУЛЬТАЦИЯ*
-• Индивидуальный разбор вашей ситуации
-
-*Выберите нужный вариант ниже:* 👇"""
-
-    bot.send_message(
-        chat_id,
-        menu_text,
-        reply_markup=markup,
-        parse_mode='Markdown'
-    )
-
-@bot.message_handler(func=lambda message: message.text and 'диагностика' in message.text.lower())
-def handle_free_product(message):
-    user_id = message.from_user.id
-    username = message.from_user.username or "нет"
-    first_name = message.from_user.first_name or "Неизвестно"
-    
-    log_action(user_id, username, first_name, 'ЗАПРОС БЕСПЛАТНОГО ПРОДУКТА')
-    send_product(message.chat.id, user_id, username, first_name, 'free')
-    
-    time.sleep(2)
-    offer_subscription_and_seasonal(message.chat.id)
-
-@bot.message_handler(func=lambda message: message.text and 'осенн' in message.text.lower())
-def handle_seasonal_product(message):
-    user_id = message.from_user.id
-    username = message.from_user.username or "нет"
-    first_name = message.from_user.first_name or "Неизвестно"
-    
-    log_action(user_id, username, first_name, 'ЗАПРОС ПЛАТНОГО ПРОДУКТА', product_type='seasonal')
-    show_payment_instructions(message.chat.id, user_id, username, first_name)
-
-def send_product(chat_id, user_id, username, first_name, product_type):
-    """Отправляет продукт"""
-    product = PRODUCTS[product_type]
-    
+async def save_pending():
+    # сохраняем pending в файл (json)
     try:
-        file_path = product['file']
-        
-        if not os.path.exists(file_path):
-            bot.send_message(chat_id, "❌ Файл временно недоступен. Свяжитесь с поддержкой: @belka1233")
-            return
-            
-        with open(file_path, 'rb') as file:
-            bot.send_document(
-                chat_id, 
-                file, 
-                caption=product['caption'],
-                parse_mode='Markdown'
-            )
-        
-        if product_type == 'free':
-            log_action(user_id, username, first_name, 'СКАЧИВАНИЕ БЕСПЛАТНОГО ПРОДУКТА')
-        else:
-            log_action(user_id, username, first_name, 'УСПЕШНАЯ ОПЛАТА', 
-                       product_type=product_type, amount=product['price'])
-            
+        async with aiofiles.open(PENDING_FILE, "w", encoding="utf-8") as f:
+            await f.write(json.dumps(pending, ensure_ascii=False))
     except Exception as e:
-        bot.send_message(chat_id, "❌ Произошла ошибка при отправке файла.")
-        print(f"Ошибка отправки файла: {e}")
+        print("Ошибка сохранения pending:", e)
 
-def show_payment_instructions(chat_id, user_id, username, first_name):
-    """Показывает инструкцию по оплате"""
-    product = PRODUCTS['seasonal']
-    
-    payment_text = f"""🍂 *{product['description'].upper()}*
+# ======================================
+# Helpers: keyboard builders
+# ======================================
+def main_menu_markup():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(types.KeyboardButton(PRODUCTS['free']['name']), types.KeyboardButton(PRODUCTS['seasonal']['name']))
+    kb.add(types.KeyboardButton(PRODUCTS['consult']['name']))
+    kb.add(types.KeyboardButton("ℹ️ Помощь"))
+    return kb
 
-*Стоимость:* {product['price']} рублей
-
-*Что внутри:*
-❄️ Особенности ухода в холодное время года
-✨ Защита волос от мороза и сухости
-💫 Борьба с электризацией и спутанностью
-🌬️ Восстановление после зимних повреждений
-🎯 Сезонные рекомендации по уходу
-
-*Как получить:*
-1. Нажмите кнопку *«ОПЛАТИТЬ {product['price']} РУБ»* ниже
-2. *Сумма уже установлена!* Просто подтвердите платеж
-3. После оплаты нажмите *«Я ОПЛАТИЛ(А)»*
-4. Получите гайд мгновенно!"""
-
+def inline_payment_markup(product_key: str, amount: int):
     markup = types.InlineKeyboardMarkup()
-    
-    # Кнопка с фиксированной оплатой
-    pay_btn = types.InlineKeyboardButton(
-        f"💳 ОПЛАТИТЬ {product['price']} РУБ", 
-        url=YOOMONEY_LINK
-    )
-    confirm_btn = types.InlineKeyboardButton("✅ Я ОПЛАТИЛ(А)", callback_data=f"confirm_payment:{user_id}")
-    back_btn = types.InlineKeyboardButton("⬅️ НАЗАД", callback_data="back_to_menu")
-    
-    markup.add(pay_btn)
-    markup.add(confirm_btn)
-    markup.add(back_btn)
+    pay_url = get_yoomoney_link(amount)
+    markup.add(types.InlineKeyboardButton(f"💳 Оплатить {amount} ₽", url=pay_url))
+    markup.add(types.InlineKeyboardButton("✅ Я оплатил(а)", callback_data=f"confirm_payment:{product_key}"))
+    markup.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu"))
+    return markup
 
-    bot.send_message(
-        chat_id,
-        payment_text,
-        reply_markup=markup,
-        parse_mode='Markdown'
-    )
+def post_buy_markup(product_key: str):
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("🌟 Подписаться на канал", url="https://t.me/volosy_v_fokuse"))
+    kb.add(types.InlineKeyboardButton("💬 Заказать консультацию", callback_data="ask_consult"))
+    return kb
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_payment:"))
-def handle_confirm_payment(call):
-    """Обработчик подтверждения оплаты"""
-    user_id = call.data.split(":")[1]
-    username = call.from_user.username or "нет"
-    first_name = call.from_user.first_name or "Неизвестно"
-    
-    # Меняем текст сообщения
-    bot.edit_message_text(
-        "✅ *Проверяем оплату...*\n\nОбычно это занимает несколько секунд ⏱️",
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode='Markdown'
-    )
-    
-    # Имитируем проверку (2 секунды)
-    time.sleep(2)
-    
-    # Выдаем продукт
-    send_product(call.message.chat.id, user_id, username, first_name, 'seasonal')
+# ======================================
+# Scheduling helpers
+# ======================================
+def schedule_followup(user_id: int, when_datetime: datetime.datetime, follow_type: str, source='bot'):
+    """
+    follow_type: 'offer_paid' (после free), 'offer_consult' (после paid)
+    """
+    job_id = f"{user_id}_{follow_type}_{int(when_datetime.timestamp())}"
+    def job_func():
+        asyncio.create_task(send_followup_message(user_id, follow_type, source))
+    # используем DateTrigger
+    trigger = DateTrigger(run_date=when_datetime)
+    scheduler.add_job(job_func, trigger=trigger, id=job_id, replace_existing=False)
+    return job_id
 
-def offer_subscription_and_seasonal(chat_id):
-    """Предлагает подписку и сезонный продукт после бесплатного"""
-    markup = types.InlineKeyboardMarkup()
-    channel_btn = types.InlineKeyboardButton("🌟 ПОДПИСАТЬСЯ НА КАНАЛ", url="https://t.me/volosy_v_fokuse")
-    seasonal_btn = types.InlineKeyboardButton(PRODUCTS['seasonal']['name'], callback_data="seasonal_info")
-    
-    markup.add(channel_btn)
-    markup.add(seasonal_btn)
-    
-    subscription_text = f"""🎉 **Вот и всё! Бесплатный гайд у вас**
+async def send_followup_message(user_id: int, follow_type: str, source='bot'):
+    try:
+        if follow_type == 'offer_paid':
+            text = ("Как тебе гайд? 🌷\n\n"
+                    "Если хочешь, я подготовила *осенне-зимний план ухода* — "
+                    "с готовыми схемами и подборкой средств. Он стоит всего *200 ₽* и позволяет сразу адаптировать уход.")
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("💳 Купить гайд (200 ₽)", url=get_yoomoney_link(PRODUCTS['seasonal']['price'])))
+            markup.add(types.InlineKeyboardButton("✅ Я оплатил(а)", callback_data=f"confirm_payment:seasonal"))
+            await bot.send_message(user_id, text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+            await log_action(user_id, "unknown", "unknown", "FOLLOWUP_OFFER_PAID", source=source, product_type='seasonal', amount=PRODUCTS['seasonal']['price'])
+        elif follow_type == 'offer_consult':
+            text = ("Уже попробовала советы из гайда? 💕\n\n"
+                    "Если хочешь, я могу подобрать тебе *персональную схему ухода* — под твой тип, бюджет и цели.\n\n"
+                    "Консультация занимает 30 минут и даёт чёткий план. Стоимость — *1500 ₽*.\n\nНапиши: *Хочу консультацию*")
+            await bot.send_message(user_id, text, parse_mode=ParseMode.MARKDOWN)
+            await log_action(user_id, "unknown", "unknown", "FOLLOWUP_OFFER_CONSULT", source=source, product_type='consult', amount=PRODUCTS['consult']['price'])
+    except Exception as e:
+        print("Ошибка при отправке followup:", e)
 
-Но это только начало! 
-
-🍂 *Хотите получить сезонные рекомендации?*
-{PRODUCTS['seasonal']['name']} всего за {PRODUCTS['seasonal']['price']} руб:
-• Защита от мороза и сухости
-• Борьба с электризацией
-• Восстановление зимой
-
-✨ *А также подпишитесь на канал - там много бесплатного полезного контента!*"""
-
-    bot.send_message(
-        chat_id,
-        subscription_text,
-        reply_markup=markup,
-        parse_mode='Markdown'
+# ======================================
+# Handlers
+# ======================================
+@dp.message_handler(commands=['start'])
+async def cmd_start(message: types.Message):
+    # parse utm/source if provided: /start source_campaign
+    args = message.get_args()
+    source = args.strip() if args else 'direct'
+    user = message.from_user
+    await log_action(user.id, user.username or "нет", user.first_name or "Неизвестно", "START", source=source)
+    await message.answer(
+        "Привет 🌸\nЯ Лена, эксперт по уходу за волосами. Выбери, с чего начнём:",
+        reply_markup=main_menu_markup()
     )
 
-def offer_subscription(chat_id):
-    """Просто предлагает подписку на канал"""
-    markup = types.InlineKeyboardMarkup()
-    subscribe_btn = types.InlineKeyboardButton("🌟 ПОДПИСАТЬСЯ НА КАНАЛ", url="https://t.me/volosy_v_fokuse")
-    markup.add(subscribe_btn)
-    
-    bot.send_message(
-        chat_id,
-        "📚 *Ежедневно делюсь полезным контентом о волосах:*",
-        reply_markup=markup,
-        parse_mode='Markdown'
-    )
-
-@bot.callback_query_handler(func=lambda call: call.data in ["back_to_menu", "seasonal_info"])
-def handle_navigation(call):
-    user_id = call.from_user.id
-    username = call.from_user.username or "нет"
-    first_name = call.from_user.first_name or "Неизвестно"
-    
-    if call.data == "back_to_menu":
-        show_main_menu(call.message.chat.id, user_id, username, first_name, 'callback')
-    elif call.data == "seasonal_info":
-        show_payment_instructions(call.message.chat.id, user_id, username, first_name)
-    
-    bot.answer_callback_query(call.id)
-
-# Обработчик для консультации
-@bot.message_handler(func=lambda message: message.text and 'консультация' in message.text.lower())
-def handle_consultation(message):
-    user_id = message.from_user.id
-    username = message.from_user.username or "нет"
-    first_name = message.from_user.first_name or "Неизвестно"
-    
-    log_action(user_id, username, first_name, 'ЗАПРОС КОНСУЛЬТАЦИИ')
-    
-    consultation_text = """👑 **Персональная консультация**
-
-Давайте составим систему ухода именно для ВАШИХ волос!
-
-За 30 минут мы:
-• Проведем полную диагностику
-• Разберем текущий уход и найдем ошибки  
-• Подберем косметику под ваш тип и бюджет
-• Составим пошаговый план действий
-
-💬 **Напишите мне в личные сообщения:** @belka1233
-
-Укажите «Консультация из бота» для быстрого ответа ✨"""
-    
-    bot.send_message(message.chat.id, consultation_text, parse_mode='Markdown')
-
-# Обработчик для помощи
-@bot.message_handler(func=lambda message: message.text and 'помощь' in message.text.lower())
-def show_help(message):
-    help_text = f"""ℹ️ *ПОМОЩЬ ПО БОТУ*
-
-*Доступные продукты:*
-{PRODUCTS['free']['name']} - бесплатная диагностика волос
-{PRODUCTS['seasonal']['name']} - сезонный уход ({PRODUCTS['seasonal']['price']} руб)
-👑 *Консультация* - персональный разбор
-
-*Как оплатить:*
-1. Нажмите «ОПЛАТИТЬ {PRODUCTS['seasonal']['price']} РУБ»
-2. *Сумма уже установлена!* Просто подтвердите платеж
-3. Нажмите «Я ОПЛАТИЛ(А)»
-4. Получите гайд мгновенно!
-
-*Проблемы с оплатой?* Напишите @belka1233"""
-
-    bot.send_message(message.chat.id, help_text, parse_mode='Markdown')
-
-# Команда для ручной выдачи доступа (для админа)
-@bot.message_handler(commands=['grant'])
-def handle_grant_access(message):
-    """Ручная выдача доступа (только для админа)"""
-    if str(message.from_user.id) != ADMIN_CHAT_ID:
-        bot.send_message(message.chat.id, "❌ Доступ запрещен")
+@dp.message_handler(lambda message: message.text and message.text == PRODUCTS['free']['name'])
+async def handle_free(message: types.Message):
+    user = message.from_user
+    await log_action(user.id, user.username or "нет", user.first_name or "Неизвестно", "REQUEST_FREE", source='menu')
+    # Отправляем файл
+    file_name = PRODUCTS['free']['file']
+    if not os.path.exists(file_name):
+        await message.answer("❌ Файл временно недоступен. Свяжитесь с поддержкой.")
         return
-        
     try:
-        parts = message.text.split()
-        if len(parts) < 2:
-            bot.send_message(message.chat.id, "Использование: /grant <user_id>")
-            return
-            
-        user_id = int(parts[1])
-        send_product(user_id, "admin", "Manual", "manual_grant", 'seasonal')
-        bot.send_message(message.chat.id, f"✅ Сезонный гайд выдан пользователю {user_id}")
-        
+        await message.answer_document(InputFile(file_name), caption=PRODUCTS['free']['caption'], parse_mode=ParseMode.MARKDOWN)
+        await log_action(user.id, user.username or "нет", user.first_name or "Неизвестно", "SENT_FREE", source='bot', product_type='free')
+        # подписка на канал кнопкой
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("🌟 Подписаться на канал", url="https://t.me/volosy_v_fokuse"))
+        await message.answer("🎉 Гайд отправлен! Я пришлю через пару часов оповещение с предложением платного гайда.", reply_markup=kb)
+        # schedule followup in 6 hours
+        when = datetime.datetime.utcnow() + datetime.timedelta(hours=6)
+        schedule_followup(user.id, when, 'offer_paid', source='bot')
     except Exception as e:
-        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+        await message.answer("Ошибка при отправке файла.")
+        print("send free error:", e)
 
-# Обработчик для любого сообщения, которое не подошло под другие хендлеры
-@bot.message_handler(func=lambda message: True)
-def handle_other_messages(message):
-    if message.text.lower() not in ['старт', 'start', 'начать', 'меню', 'главная', 'помощь', 'инфо']:
-        # Показываем главное меню
-        user_id = message.from_user.id
-        username = message.from_user.username or "нет"
-        first_name = message.from_user.first_name or "Неизвестно"
-        show_main_menu(message.chat.id, user_id, username, first_name, 'unknown_command')
+@dp.message_handler(lambda message: message.text and message.text == PRODUCTS['seasonal']['name'])
+async def handle_seasonal_request(message: types.Message):
+    user = message.from_user
+    await log_action(user.id, user.username or "нет", user.first_name or "Неизвестно", "REQUEST_SEASONAL", source='menu', product_type='seasonal', amount=PRODUCTS['seasonal']['price'])
+    # show payment instructions
+    markup = inline_payment_markup('seasonal', PRODUCTS['seasonal']['price'])
+    payment_text = (f"🍂 *{PRODUCTS['seasonal']['description'].upper()}*\n\n"
+                    f"*Стоимость:* {PRODUCTS['seasonal']['price']} рублей\n\n"
+                    "Нажмите оплатить, затем — «Я оплатил(а)»")
+    await message.answer(payment_text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
 
+@dp.message_handler(lambda message: message.text and message.text == PRODUCTS['consult']['name'])
+async def handle_consult_request(message: types.Message):
+    user = message.from_user
+    await log_action(user.id, user.username or "нет", user.first_name or "Неизвестно", "REQUEST_CONSULT", source='menu', product_type='consult', amount=PRODUCTS['consult']['price'])
+    markup = inline_payment_markup('consult', PRODUCTS['consult']['price'])
+    consult_text = (f"👑 *{PRODUCTS['consult']['description']}*\n\n"
+                    f"*Стоимость:* {PRODUCTS['consult']['price']} рублей\n\n"
+                    "После оплаты напиши здесь «✅ Я оплатил(а)», и мы договоримся о времени.")
+    await message.answer(consult_text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+
+@dp.callback_query_handler(lambda c: c.data == "back_to_menu")
+async def cb_back_to_menu(call: types.CallbackQuery):
+    user = call.from_user
+    await log_action(user.id, user.username or "нет", user.first_name or "Неизвестно", "NAV_BACK", source='callback')
+    await bot.edit_message_text("Возвращаю меню.", call.message.chat.id, call.message.message_id)
+    await bot.send_message(call.message.chat.id, "Главное меню:", reply_markup=main_menu_markup())
+
+@dp.callback_query_handler(lambda c: c.data.startswith("confirm_payment:"))
+async def cb_confirm_payment(call: types.CallbackQuery):
+    user = call.from_user
+    data = call.data.split(":")
+    if len(data) < 2:
+        await call.answer("Ошибка данных.")
+        return
+    product_key = data[1]
+    amount = PRODUCTS.get(product_key, {}).get('price', 0)
+    # помечаем pending
+    pending_key = str(user.id)
+    pending[pending_key] = {
+        "user_id": user.id,
+        "username": user.username or "нет",
+        "first_name": user.first_name or "Неизвестно",
+        "product": product_key,
+        "amount": amount,
+        "time": datetime.datetime.utcnow().isoformat()
+    }
+    await save_pending()
+    await log_action(user.id, user.username or "нет", user.first_name or "Неизвестно", "PENDING_PAYMENT", source='bot', product_type=product_key, amount=amount)
+    # уведомить пользователя и админа
+    await bot.edit_message_text("✅ Мы отмечаем оплату как «Ожидающая проверка». Администратор проверит и выдаст доступ в ближайшее время.", call.message.chat.id, call.message.message_id)
+    await bot.send_message(user.id, "Спасибо! Мы получили запрос на проверку оплаты. Как только админ подтвердит — получите гайд/доступ.")
+    # отправляем админу сообщение (логика в log_action уже уведомляет, но добавлю подробное)
+    await bot.send_message(ADMIN_CHAT_ID, f"📌 Платёж ожидает проверки:\nПользователь: {user.id} (@{user.username})\nПродукт: {product_key}\nСумма: {amount} руб\nВыдать: /grant {user.id} {product_key}")
+
+@dp.message_handler(commands=['grant'])
+async def cmd_grant(message: types.Message):
+    # только админ
+    if message.from_user.id != ADMIN_CHAT_ID:
+        await message.reply("❌ Доступ запрещён.")
+        return
+    parts = message.text.split()
+    if len(parts) < 3:
+        await message.reply("Использование: /grant <user_id> <product_key>")
+        return
+    try:
+        user_id = int(parts[1])
+        product_key = parts[2]
+        if product_key not in PRODUCTS:
+            await message.reply("Неверный product_key.")
+            return
+        # выдаём продукт (если pdf)
+        if PRODUCTS[product_key]['file']:
+            file_path = PRODUCTS[product_key]['file']
+            if not os.path.exists(file_path):
+                await message.reply("Файл не найден.")
+                return
+            await bot.send_document(user_id, InputFile(file_path), caption=PRODUCTS[product_key]['caption'], parse_mode=ParseMode.MARKDOWN)
+        else:
+            # для консультации — отправляем инструкцию по записи
+            await bot.send_message(user_id, "Спасибо! Ваша оплата подтверждена. Напишите, пожалуйста, удобное время для консультации — и мы согласуем встречу.")
+        await log_action(user_id, "unknown", "unknown", "GRANT", product_type=product_key, amount=PRODUCTS[product_key]['price'])
+        # удалить из pending, если был
+        pending_key = str(user_id)
+        if pending_key in pending:
+            pending.pop(pending_key)
+            await save_pending()
+        await message.reply("Готово — доступ выдан.")
+    except Exception as e:
+        await message.reply(f"Ошибка: {e}")
+
+@dp.message_handler(lambda message: message.text and message.text.lower().strip() in ["я оплатил", "я оплатила", "оплатил", "оплатила", "✅ я оплатил(а)"])
+async def user_confirm_paid_text(message: types.Message):
+    user = message.from_user
+    # если есть pending — уведомим админа
+    pending_key = str(user.id)
+    if pending_key in pending:
+        await message.reply("Спасибо! Мы передали информацию администратору на проверку. Скоро всё подтвердим.")
+        await bot.send_message(ADMIN_CHAT_ID, f"Пользователь {user.id} подтвердил оплату — проверьте: /grant {user.id} {pending[pending_key]['product']}")
+    else:
+        await message.reply("Если вы оплатили — нажмите кнопку «Я оплатил(а)» в оплатном меню, или пришлите скрин чека, и админ проверит оплату.")
+
+@dp.message_handler(lambda message: message.text and message.text.lower().strip() == "хочу консультацию")
+async def want_consult(message: types.Message):
+    user = message.from_user
+    # предложим оплату/инструкцию
+    markup = inline_payment_markup('consult', PRODUCTS['consult']['price'])
+    await message.answer("Чтобы записаться на консультацию, оплатите, пожалуйста:", reply_markup=markup)
+
+@dp.message_handler(lambda message: message.text and message.text.lower().strip() == "меню")
+async def show_menu_cmd(message: types.Message):
+    await message.answer("Главное меню:", reply_markup=main_menu_markup())
+
+@dp.message_handler(content_types=types.ContentTypes.ANY)
+async def fallback(message: types.Message):
+    # если пользователь пишет что-то неизвестное — показываем меню
+    if message.text and message.text.lower().strip() in ['старт', 'start', 'начать', 'меню', 'главная']:
+        await message.answer("Главное меню:", reply_markup=main_menu_markup())
+        return
+    # не обрабатываем файлы и т.п. иначе
+    await message.answer("Я могу помочь с диагностикой, гайдом и консультацией. Нажми кнопку в меню.", reply_markup=main_menu_markup())
+
+# ======================================
+# При запуске - восстановим планировщик для уже сохранённых pending, если нужно
+# ======================================
+def restore_followups_from_pending():
+    # для каждого pending можем переотправить followup через небольшой промежуток,
+    # но обычно followups уже запланированы при выдаче free. Здесь - ничего не делаем.
+    # (опционально можно реализовать восстановление по таймеру)
+    pass
+
+# ======================================
+# Запуск
+# ======================================
 if __name__ == "__main__":
-    print("🤖 Бот запущен с двумя продуктами!")
-    print(f"🎁 Бесплатный: {PRODUCTS['free']['file']}")
-    print(f"🍂 Платный: {PRODUCTS['seasonal']['file']} - {PRODUCTS['seasonal']['price']} руб")
-    print(f"🔗 Ссылка оплаты: {YOOMONEY_LINK}")
-    
-    while True:
-        try:
-            bot.polling(none_stop=True, timeout=60)
-        except Exception as e:
-            print(f"❌ Ошибка: {e}")
-            time.sleep(10)
+    print("Бот запускается...")
+    restore_followups_from_pending()
+    executor.start_polling(dp, skip_updates=True)
