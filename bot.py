@@ -13,7 +13,7 @@ import aiofiles
 
 # Загрузка конфигов
 load_dotenv()
-BOT_TOKEN = "8469042166:AAGTV25OnbgUTHe14CVba66tFXSIwcEGG7o"
+BOT_TOKEN = "8469042166:AAGTV250nbgUTHe14CVba66tFXSIwcEGG7o"
 ADMIN_CHAT_ID = 680094245
 
 # Параметры продуктов (ключи используются в логике)
