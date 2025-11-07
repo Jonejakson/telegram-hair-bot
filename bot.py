@@ -13,7 +13,7 @@ import aiofiles
 # CONFIG
 # =========================================
 load_dotenv()
-BOT_TOKEN = "ВАШ_ТОКЕН"  # ← вставь свой токен
+BOT_TOKEN = "8469042166:AAGTV250nbgUTHe14CVba66tFXSIwcEGG7o"  # ← вставь свой токен
 ADMIN_CHAT_ID = 680094245
 
 PRODUCTS = {
